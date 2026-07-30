@@ -33,3 +33,7 @@ streamlit run app.py
 ## Limitaciones técnicas
 
 El módulo histórico usa Sentinel-2 L2A, disponible para análisis consistente aproximadamente desde 2016. Los resultados son indicadores territoriales para priorización y revisión humana; no confirman fosas, delitos ni hechos periciales. La selección de una escena por año reduce costos de cómputo, pero una versión institucional debería incorporar mosaicos compuestos, máscaras de nubes y PostgreSQL/PostGIS.
+
+
+## Comparador visual v3
+El módulo **Análisis territorial** ahora guía al usuario en cinco pasos: marcar área, elegir periodos, comparar, revisar anomalías y exportar. Presenta imágenes satelitales antes/después, mapa de diferencias NDVI, máscara de anomalías, interpretación operativa y descargas PNG/JSON.
