@@ -26,6 +26,8 @@ from pyproj import Geod
 from shapely.geometry import mapping, shape
 from shapely.ops import unary_union
 
+from core.source_catalog import scan_multisource_catalog
+
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "sentinel-2-l2a"
 ARCHIVE_START_YEAR = 2016
@@ -712,6 +714,31 @@ def historical_kmz(result: dict[str, Any]) -> bytes:
             transition=label,
         )
 
+    source_inventory = result.get("source_inventory") or {}
+    source_summary = source_inventory.get("summary")
+    if isinstance(source_summary, pd.DataFrame) and not source_summary.empty:
+        sources_folder = ET.SubElement(document, _kml_tag("Folder"))
+        ET.SubElement(sources_folder, _kml_tag("name")).text = "04 · Fuentes consultadas"
+        ET.SubElement(sources_folder, _kml_tag("open")).text = "0"
+        ET.SubElement(sources_folder, _kml_tag("visibility")).text = "0"
+        center_lon = (float(result["bbox"][0]) + float(result["bbox"][2])) / 2
+        center_lat = (float(result["bbox"][1]) + float(result["bbox"][3])) / 2
+        for _, row in source_summary.iterrows():
+            placemark = ET.SubElement(sources_folder, _kml_tag("Placemark"))
+            ET.SubElement(placemark, _kml_tag("name")).text = (
+                f"{row.get('provider', 'Fuente')} · {row.get('dataset', '')}"
+            )
+            ET.SubElement(placemark, _kml_tag("visibility")).text = "0"
+            ET.SubElement(placemark, _kml_tag("description")).text = str(
+                row.get("detectability") or row.get("recommended_use") or "Fuente consultada"
+            )
+            _append_extended_data(placemark, row.to_dict())
+            point = ET.SubElement(placemark, _kml_tag("Point"))
+            ET.SubElement(point, _kml_tag("altitudeMode")).text = "clampToGround"
+            ET.SubElement(point, _kml_tag("coordinates")).text = (
+                f"{center_lon:.8f},{center_lat:.8f},0"
+            )
+
     kml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     output = BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -902,6 +929,8 @@ def analyze_historical_series(
     threshold: float = 0.24,
     min_patch_pixels: int = 12,
     progress_callback: Callable[[float, str], None] | None = None,
+    scan_additional_sources: bool = True,
+    planet_api_key: str | None = None,
 ) -> dict[str, Any]:
     """Construye una serie anual comparable y detecta transiciones interanuales."""
     if start_year < ARCHIVE_START_YEAR:
@@ -1050,6 +1079,28 @@ def analyze_historical_series(
     ]
 
     total_scenes = len(scene_previews)
+
+    source_inventory: dict[str, Any] | None = None
+    if scan_additional_sources:
+        try:
+            if progress_callback:
+                progress_callback(1.0, "Consultando fuentes adicionales…")
+            source_inventory = scan_multisource_catalog(
+                bbox=bbox,
+                aoi_geometry=aoi_geometry or {
+                    "type": "Polygon",
+                    "coordinates": [[[bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[2], bbox[3]], [bbox[0], bbox[3]], [bbox[0], bbox[1]]]],
+                },
+                start=_safe_date(start_year, window_start.month, window_start.day),
+                end=_safe_date(end_year, window_end.month, window_end.day),
+                max_cloud=max_cloud,
+                planet_api_key=planet_api_key,
+            )
+            warnings.extend([f"Fuentes: {message}" for message in source_inventory.get("warnings", [])])
+        except Exception as exc:
+            warnings.append(f"No fue posible completar la exploración multifuente: {exc}")
+            source_inventory = None
+
     interpretation = (
         f"Se construyeron mosaicos válidos para {len(valid_years)} años utilizando {total_scenes} escenas. "
         f"La transición con mayor proporción de cambio fue {strongest_label} "
@@ -1070,6 +1121,7 @@ def analyze_historical_series(
         "transition_geojsons": transition_geojsons,
         "scene_previews": scene_previews,
         "candidates": pd.DataFrame(candidate_rows),
+        "source_inventory": source_inventory,
         "warnings": warnings,
         "strongest_transition": strongest_row,
         "strongest_assets": transition_assets[strongest_label],
@@ -1100,6 +1152,8 @@ def analyze_historical_series(
             "scenes_per_year": scenes_per_year,
             "threshold": threshold,
             "total_used_scenes": total_scenes,
+            "additional_source_scan": bool(scan_additional_sources),
+            "best_additional_source": (source_inventory or {}).get("best_source"),
         },
     }
 
@@ -1161,6 +1215,44 @@ def historical_gallery_zip(result: dict[str, Any]) -> bytes:
             "metadatos.json",
             json.dumps(_clean_metadata(result["metadata"]), ensure_ascii=False, indent=2),
         )
+        source_inventory = result.get("source_inventory") or {}
+        source_summary = source_inventory.get("summary")
+        source_scene_table = source_inventory.get("scene_table")
+        if isinstance(source_summary, pd.DataFrame):
+            archive.writestr(
+                "fuentes_multifuente/resumen_fuentes.csv",
+                source_summary.to_csv(index=False).encode("utf-8-sig"),
+            )
+        if isinstance(source_scene_table, pd.DataFrame):
+            archive.writestr(
+                "fuentes_multifuente/escenas_encontradas.csv",
+                source_scene_table.to_csv(index=False).encode("utf-8-sig"),
+            )
+        archive.writestr(
+            "fuentes_multifuente/evaluacion.json",
+            json.dumps(
+                _clean_metadata({
+                    "best_source": source_inventory.get("best_source"),
+                    "scan_start": source_inventory.get("scan_start"),
+                    "scan_end": source_inventory.get("scan_end"),
+                    "warnings": source_inventory.get("warnings", []),
+                }),
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        highres_index = 0
+        for scene in source_inventory.get("scenes", []):
+            preview = scene.get("preview_png")
+            if not preview:
+                continue
+            highres_index += 1
+            year = (scene.get("datetime") or "sin_fecha")[:4]
+            safe_id = str(scene.get("scene_id") or highres_index).replace("/", "_")
+            archive.writestr(
+                f"fuentes_multifuente/previsualizaciones/{highres_index:03d}_{year}_{safe_id}.png",
+                preview,
+            )
         for annual in result["annual_gallery"]:
             archive.writestr(
                 f"mosaicos_anuales/{annual['year']}_mosaico.png",
@@ -1228,6 +1320,13 @@ def historical_report_excel(result: dict[str, Any]) -> bytes:
         result["transitions"].to_excel(writer, index=False, sheet_name="Transiciones")
         pd.DataFrame(scene_rows).to_excel(writer, index=False, sheet_name="Escenas utilizadas")
         result["candidates"].to_excel(writer, index=False, sheet_name="Escenas candidatas")
+        source_inventory = result.get("source_inventory") or {}
+        source_summary = source_inventory.get("summary")
+        source_scene_table = source_inventory.get("scene_table")
+        if isinstance(source_summary, pd.DataFrame):
+            source_summary.to_excel(writer, index=False, sheet_name="Fuentes consultadas")
+        if isinstance(source_scene_table, pd.DataFrame):
+            source_scene_table.to_excel(writer, index=False, sheet_name="Catálogo multifuente")
         pd.DataFrame(result["accumulated_geojson"]["features"]).to_excel(
             writer, index=False, sheet_name="Anomalias acumuladas"
         )

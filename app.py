@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from datetime import date
 from typing import Any
 
@@ -18,14 +19,14 @@ from core.engine import (
 )
 
 st.set_page_config(
-    page_title="Sentinel IAT · Serie histórica anual",
+    page_title="Sentinel IAT · Fusión multifuente",
     page_icon="🛰️",
     layout="wide",
 )
 
-st.title("🛰️ Sentinel IAT · Serie Histórica Anual")
+st.title("🛰️ Sentinel IAT · Serie Histórica y Fusión Multifuente")
 st.caption(
-    "Análisis multitemporal de imágenes Sentinel-2 para localizar, visualizar y exportar cambios territoriales"
+    "Serie histórica Sentinel-2 con exploración automática de Landsat, radar Sentinel-1, INEGI y Planet opcional"
 )
 st.warning(
     "El sistema identifica áreas prioritarias para revisión. No confirma fosas, delitos ni hallazgos periciales."
@@ -36,13 +37,15 @@ with st.expander("¿Cómo trabaja este módulo?", expanded=True):
         """
         1. Dibuje el **polígono exacto** que desea analizar.
         2. Seleccione los años y una misma ventana estacional para toda la serie.
-        3. El motor consulta imágenes **Sentinel-2 L2A** en Microsoft Planetary Computer.
+        3. El motor construye la serie analítica con **Sentinel-2 L2A**.
         4. Elimina nubes, sombras y nieve mediante la capa SCL.
         5. Construye un mosaico anual y calcula NDVI, NDMI, NBR y BSI.
         6. Compara los años consecutivos y localiza la transición de mayor cambio.
-        7. Genera polígonos acumulados e interanuales para revisión y exportación a KMZ.
+        7. Consulta automáticamente fuentes complementarias: Landsat, Sentinel-1 SAR e imágenes INEGI WMS.
+        8. Si existe una `PLANET_API_KEY`, busca además PlanetScope y SkySat sin generar pedidos ni cargos.
+        9. Genera polígonos acumulados e interanuales para revisión y exportación a KMZ.
 
-        El análisis queda restringido al interior real del polígono dibujado, no al rectángulo que lo contiene.
+        El análisis queda restringido al interior real del polígono dibujado. Las fuentes de alta resolución se usan para verificación visual; el sistema no inventa detecciones de objetos cuando la resolución no lo permite.
         """
     )
 
@@ -128,6 +131,17 @@ def _add_image_overlay(
     ).add_to(m)
 
 
+def _secret(name: str) -> str | None:
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    value = os.getenv(name)
+    return value or None
+
+
 def _show_scene_gallery(scene_previews: list[dict[str, Any]], year_filter: str) -> None:
     previews = scene_previews
     if year_filter != "Todos":
@@ -185,6 +199,20 @@ if historical_result and show_last_analysis:
         f"Sentinel-2 {historical_result['valid_years'][-1]} · último análisis",
         show=True,
     )
+
+if historical_result:
+    source_inventory = historical_result.get("source_inventory") or {}
+    for layer in source_inventory.get("inegi_layers", [])[:5]:
+        folium.raster_layers.WmsTileLayer(
+            url="https://gaia.inegi.org.mx/NLB/tunnel/wms/wms61?",
+            layers=layer["name"],
+            fmt="image/png",
+            transparent=True,
+            name=f"INEGI · {layer['title']}",
+            overlay=True,
+            control=True,
+            show=False,
+        ).add_to(mapa)
 
 saved_geometry = st.session_state.get("aoi_geometry")
 if saved_geometry:
@@ -287,6 +315,20 @@ threshold = c7.slider(
     "Sensibilidad de anomalía", 0.10, 0.50, 0.24, 0.01, key="hist_threshold"
 )
 
+scan_additional_sources = st.checkbox(
+    "Explorar automáticamente fuentes complementarias y de mayor resolución",
+    value=True,
+    help=(
+        "Consulta Landsat, Sentinel-1 SAR e INEGI WMS. PlanetScope/SkySat se consulta solo "
+        "cuando PLANET_API_KEY está configurada; nunca se realizan compras automáticamente."
+    ),
+)
+if scan_additional_sources:
+    if _secret("PLANET_API_KEY"):
+        st.caption("Conector Planet habilitado para búsqueda de catálogo. Descargar u ordenar depende de la licencia.")
+    else:
+        st.caption("Fuentes abiertas habilitadas. Planet está preparado, pero requiere PLANET_API_KEY en Streamlit Secrets.")
+
 years_requested = int(end_year) - int(start_year) + 1
 st.caption(
     f"Procesamiento estimado: {years_requested} años × hasta {scenes_per_year} escenas = "
@@ -318,6 +360,8 @@ if run_history:
             scenes_per_year=scenes_per_year,
             threshold=threshold,
             progress_callback=update_progress,
+            scan_additional_sources=scan_additional_sources,
+            planet_api_key=_secret("PLANET_API_KEY"),
         )
         st.session_state["historical_result"] = result
         historical_result = result
@@ -339,11 +383,12 @@ if historical_result:
     m5.metric("Cambio máximo", f"{strongest['changed_pct']:.1f}%")
     st.info(historical_result["interpretation"])
 
-    summary_tab, annual_tab, scenes_tab, technical_tab = st.tabs(
+    summary_tab, annual_tab, scenes_tab, sources_tab, technical_tab = st.tabs(
         [
             "Evolución y mayor cambio",
             "Mosaicos de todos los años",
             "Imágenes utilizadas",
+            "Fuentes multifuente",
             "Tablas técnicas",
         ]
     )
@@ -410,6 +455,63 @@ if historical_result:
         )
         _show_scene_gallery(historical_result["scene_previews"], selected_year)
 
+    with sources_tab:
+        source_inventory = historical_result.get("source_inventory")
+        if not source_inventory:
+            st.info("La exploración multifuente no fue ejecutada en este análisis.")
+        else:
+            best = source_inventory.get("best_source") or {}
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("Mejor fuente localizada", best.get("best_dataset") or "No confirmada")
+            resolution = best.get("best_resolution_m")
+            b2.metric("Mejor resolución", f"{resolution:g} m" if resolution is not None else "N/D")
+            b3.metric("Fecha más reciente", best.get("latest_date") or "N/D")
+            b4.metric(
+                "Inspección de objetos",
+                "Posible" if best.get("object_inspection_ready") else "No confiable",
+            )
+            if best.get("object_inspection_ready"):
+                st.success(best.get("assessment"))
+            else:
+                st.info(best.get("assessment"))
+
+            st.markdown("### Fuentes consultadas automáticamente")
+            st.dataframe(source_inventory["summary"], width="stretch", hide_index=True)
+
+            highres_previews = [
+                scene for scene in source_inventory.get("scenes", []) if scene.get("preview_png")
+            ]
+            if highres_previews:
+                st.markdown("### Imágenes adicionales obtenidas automáticamente")
+                st.caption(
+                    "Estas vistas provienen de servicios externos como INEGI WMS. La fecha y resolución "
+                    "dependen de la capa publicada; sirven para inspección visual, no sustituyen validación de campo."
+                )
+                cols = st.columns(3)
+                for index, scene in enumerate(highres_previews):
+                    year = (scene.get("datetime") or "Sin fecha")[:4]
+                    resolution = scene.get("resolution_m")
+                    resolution_text = f"{resolution:g} m" if resolution is not None else "N/D"
+                    cols[index % 3].image(
+                        scene["preview_png"],
+                        caption=(
+                            f"{scene.get('provider')} · {year} · Resolución nominal: {resolution_text}\n"
+                            f"{scene.get('dataset')}"
+                        ),
+                        width="stretch",
+                    )
+            else:
+                st.warning(
+                    "No se obtuvo una previsualización abierta de alta resolución para este AOI. "
+                    "El análisis Sentinel-2 sigue siendo válido para cambios territoriales, no para vehículos o personas."
+                )
+
+            with st.expander("Catálogo completo de escenas adicionales"):
+                st.dataframe(source_inventory["scene_table"], width="stretch", hide_index=True)
+            if source_inventory.get("warnings"):
+                with st.expander("Advertencias de fuentes"):
+                    st.code("\n".join(source_inventory["warnings"]))
+
     with technical_tab:
         st.markdown("### Serie anual")
         st.dataframe(historical_result["annual"], width="stretch", hide_index=True)
@@ -439,6 +541,10 @@ if historical_result:
 
     first_year = historical_result["valid_years"][0]
     last_year = historical_result["valid_years"][-1]
+    source_inventory = historical_result.get("source_inventory") or {}
+    inegi_reference_options = [
+        f"INEGI · {layer['title']}" for layer in source_inventory.get("inegi_layers", [])[:8]
+    ]
     final_reference = st.selectbox(
         "Vista inicial del mapa final",
         [
@@ -446,6 +552,7 @@ if historical_result:
             f"Sentinel-2 {first_year}",
             "Esri World Imagery",
             "OpenStreetMap",
+            *inegi_reference_options,
         ],
     )
 
@@ -459,6 +566,54 @@ if historical_result:
         "OpenStreetMap" if final_reference == "OpenStreetMap" else "Esri World Imagery"
     )
     _add_base_layers(final_map, preferred=preferred_base)
+
+    source_inventory = historical_result.get("source_inventory") or {}
+    for layer in source_inventory.get("inegi_layers", [])[:8]:
+        layer_label = f"INEGI · {layer['title']}"
+        folium.raster_layers.WmsTileLayer(
+            url="https://gaia.inegi.org.mx/NLB/tunnel/wms/wms61?",
+            layers=layer["name"],
+            fmt="image/png",
+            transparent=True,
+            name=layer_label,
+            overlay=True,
+            control=True,
+            show=final_reference == layer_label,
+        ).add_to(final_map)
+
+    source_footprints: dict[str, list[dict[str, Any]]] = {}
+    for scene in source_inventory.get("scenes", []):
+        geometry = scene.get("geometry")
+        if not geometry:
+            continue
+        source_footprints.setdefault(scene.get("dataset") or "Fuente", []).append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "scene_id": scene.get("scene_id"),
+                    "fecha": scene.get("datetime"),
+                    "fuente": scene.get("dataset"),
+                    "resolucion_m": scene.get("resolution_m"),
+                },
+                "geometry": geometry,
+            }
+        )
+    for dataset, features in source_footprints.items():
+        folium.GeoJson(
+            {"type": "FeatureCollection", "features": features[:30]},
+            name=f"Cobertura de escenas · {dataset}",
+            style_function=lambda _: {
+                "color": "#8a2be2",
+                "weight": 2,
+                "fillColor": "#8a2be2",
+                "fillOpacity": 0.04,
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=["fuente", "scene_id", "fecha", "resolucion_m"],
+                aliases=["Fuente:", "Escena:", "Fecha:", "Resolución m:"],
+            ),
+            show=False,
+        ).add_to(final_map)
 
     first_overlay_show = final_reference == f"Sentinel-2 {first_year}"
     last_overlay_show = final_reference == f"Sentinel-2 {last_year}"
@@ -582,6 +737,7 @@ if historical_result:
 
 st.divider()
 st.caption(
-    "Fuente analítica: Microsoft Planetary Computer STAC · colección sentinel-2-l2a · "
-    "datos Copernicus Sentinel-2 de reflectancia de superficie. Esri y OpenStreetMap se usan únicamente como referencia cartográfica."
+    "Fuente analítica principal: Microsoft Planetary Computer STAC · sentinel-2-l2a. "
+    "Fuentes complementarias: Landsat C2 L2, Sentinel-1 RTC, INEGI WMS y Planet opcional con licencia. "
+    "Esri y OpenStreetMap se usan únicamente como referencia cartográfica."
 )
