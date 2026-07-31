@@ -1,21 +1,28 @@
-# Sentinel IAT · Motor de Detección de Anomalías v2
+# Sentinel IAT · Motor histórico de anomalías territoriales
 
-Versión enfocada únicamente en comparación multitemporal de imágenes Sentinel-2.
+Aplicación Streamlit enfocada exclusivamente en análisis satelital sobre un área marcada.
 
 ## Funciones
-- Área marcada mediante rectángulo o polígono.
-- Mosaico mediano de varias escenas por periodo.
-- Máscara de nubes/sombras/nieve usando SCL.
-- Índices NDVI, NDMI, NBR y BSI.
-- Puntuación multiespectral de cambio.
-- Polígonos GeoJSON de áreas priorizadas.
-- Exportación Excel, GeoJSON, PNG y JSON.
+
+- Comparación A/B con mosaicos multiescena.
+- Galería de todas las escenas utilizadas en cada comparación.
+- Serie histórica anual desde 2016 hasta el año actual.
+- Mosaico visual por año con la misma ventana estacional.
+- NDVI, NDMI, NBR y BSI por año.
+- Detección de la transición interanual con mayor cambio.
+- Exportación Excel, GeoJSON, JSON, PNG y paquetes ZIP con imágenes y metadatos.
 
 ## Ejecución
+
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Alcance
-Detecta y prioriza cambios territoriales. No confirma fosas, delitos ni hallazgos.
+## Fuente
+
+Microsoft Planetary Computer STAC, colección `sentinel-2-l2a`.
+
+## Advertencia
+
+El sistema prioriza cambios territoriales para revisión. No identifica causas ni confirma fosas, delitos o hallazgos periciales.
