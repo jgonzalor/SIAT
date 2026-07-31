@@ -1,62 +1,204 @@
 from __future__ import annotations
 
-import json
-from datetime import date, timedelta
+import base64
+from datetime import date
+from typing import Any
 
 import folium
-import pandas as pd
 import streamlit as st
 from folium.plugins import Draw, Fullscreen, MeasureControl
 from streamlit_folium import st_folium
 
 from core.engine import (
     ARCHIVE_START_YEAR,
-    analyze_change,
     analyze_historical_series,
-    comparison_gallery_zip,
     historical_gallery_zip,
+    historical_kmz,
     historical_report_excel,
-    report_excel,
 )
 
 st.set_page_config(
-    page_title="Sentinel IAT · Anomalías territoriales",
+    page_title="Sentinel IAT · Serie histórica anual",
     page_icon="🛰️",
     layout="wide",
 )
 
-st.title("🛰️ Sentinel IAT · Motor de Anomalías Territoriales")
+st.title("🛰️ Sentinel IAT · Serie Histórica Anual")
 st.caption(
-    "Análisis visual, multiespectral e histórico de imágenes Sentinel-2 sobre un área marcada"
+    "Análisis multitemporal de imágenes Sentinel-2 para localizar, visualizar y exportar cambios territoriales"
 )
 st.warning(
-    "El sistema prioriza cambios territoriales para revisión. No confirma fosas, delitos ni hallazgos periciales."
+    "El sistema identifica áreas prioritarias para revisión. No confirma fosas, delitos ni hallazgos periciales."
 )
 
-with st.expander("¿Qué analiza realmente?", expanded=True):
+with st.expander("¿Cómo trabaja este módulo?", expanded=True):
     st.markdown(
         """
-        El motor consulta imágenes **Sentinel-2 L2A**, recorta exactamente el área marcada,
-        elimina nubes y sombras mediante la clasificación SCL, genera vistas en color natural
-        y calcula NDVI, NDMI, NBR y BSI. Puede trabajar de dos formas:
+        1. Dibuje el **polígono exacto** que desea analizar.
+        2. Seleccione los años y una misma ventana estacional para toda la serie.
+        3. El motor consulta imágenes **Sentinel-2 L2A** en Microsoft Planetary Computer.
+        4. Elimina nubes, sombras y nieve mediante la capa SCL.
+        5. Construye un mosaico anual y calcula NDVI, NDMI, NBR y BSI.
+        6. Compara los años consecutivos y localiza la transición de mayor cambio.
+        7. Genera polígonos acumulados e interanuales para revisión y exportación a KMZ.
 
-        1. **Comparación A/B:** contrasta dos periodos concretos.
-        2. **Serie histórica:** construye un mosaico comparable por cada año y localiza la
-           transición anual con mayor cambio.
-
-        Las imágenes mostradas en la galería son vistas RGB derivadas de las bandas originales
-        B04, B03 y B02 que sí participaron en el análisis.
+        El análisis queda restringido al interior real del polígono dibujado, no al rectángulo que lo contiene.
         """
     )
 
-st.subheader("1. Marque el área de estudio")
-mapa = folium.Map(location=[24.8, -107.4], zoom_start=7, tiles=None, control_scale=True)
-folium.TileLayer("OpenStreetMap", name="Mapa").add_to(mapa)
-folium.TileLayer(
-    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    attr="Esri",
-    name="Satélite de referencia",
-).add_to(mapa)
+
+def _geometry_from_state(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not state:
+        return None
+    drawing = state.get("last_active_drawing")
+    if drawing and drawing.get("geometry"):
+        return drawing["geometry"]
+    drawings = state.get("all_drawings") or []
+    if drawings:
+        geometry = drawings[-1].get("geometry")
+        if geometry:
+            return geometry
+    return None
+
+
+def _bbox_from_geometry(geometry: dict[str, Any] | None) -> list[float] | None:
+    if not geometry:
+        return None
+
+    points: list[tuple[float, float]] = []
+
+    def visit(value: Any) -> None:
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) >= 2
+            and isinstance(value[0], (int, float))
+            and isinstance(value[1], (int, float))
+        ):
+            points.append((float(value[0]), float(value[1])))
+            return
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    visit(geometry.get("coordinates", []))
+    if not points:
+        return None
+    lons = [point[0] for point in points]
+    lats = [point[1] for point in points]
+    return [min(lons), min(lats), max(lons), max(lats)]
+
+
+def _png_data_uri(png_bytes: bytes) -> str:
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _add_base_layers(m: folium.Map, preferred: str = "Esri World Imagery") -> None:
+    folium.TileLayer(
+        "OpenStreetMap",
+        name="OpenStreetMap",
+        show=preferred == "OpenStreetMap",
+    ).add_to(m)
+    folium.TileLayer(
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles © Esri and contributors",
+        name="Esri World Imagery",
+        show=preferred == "Esri World Imagery",
+    ).add_to(m)
+
+
+def _add_image_overlay(
+    m: folium.Map,
+    png_bytes: bytes,
+    bbox: list[float],
+    name: str,
+    show: bool,
+    opacity: float = 0.88,
+) -> None:
+    west, south, east, north = bbox
+    folium.raster_layers.ImageOverlay(
+        image=_png_data_uri(png_bytes),
+        bounds=[[south, west], [north, east]],
+        name=name,
+        opacity=opacity,
+        interactive=True,
+        cross_origin=False,
+        zindex=3,
+        show=show,
+    ).add_to(m)
+
+
+def _show_scene_gallery(scene_previews: list[dict[str, Any]], year_filter: str) -> None:
+    previews = scene_previews
+    if year_filter != "Todos":
+        previews = [row for row in previews if row.get("year") == int(year_filter)]
+    if not previews:
+        st.info("No hay imágenes utilizadas para el filtro seleccionado.")
+        return
+    columns = st.columns(3)
+    for index, scene in enumerate(previews):
+        capture_date = (scene.get("datetime") or "Sin fecha")[:10]
+        cloud = float(scene.get("cloud_cover", 0) or 0)
+        valid = float(scene.get("valid_coverage_pct", 0) or 0)
+        caption = (
+            f"{scene.get('year', '')} · {capture_date}\n"
+            f"Nubes: {cloud:.1f}% · Cobertura útil: {valid:.1f}%\n"
+            f"{scene.get('scene_id', '')}"
+        )
+        columns[index % 3].image(
+            scene["preview_png"], caption=caption, width="stretch"
+        )
+
+
+historical_result = st.session_state.get("historical_result")
+
+st.subheader("1. Dibuje el área exacta de estudio")
+map_reference = st.radio(
+    "Mapa de referencia para marcar el polígono",
+    ["Esri World Imagery", "OpenStreetMap"],
+    horizontal=True,
+    help=(
+        "Estas capas sirven únicamente para ubicar el área. El análisis utiliza imágenes "
+        "Sentinel-2 fechadas y procesadas por el motor."
+    ),
+)
+show_last_analysis = False
+if historical_result:
+    show_last_analysis = st.checkbox(
+        f"Mostrar mosaico Sentinel-2 del último análisis ({historical_result['valid_years'][-1]})",
+        value=False,
+    )
+
+mapa = folium.Map(
+    location=[24.8, -107.4],
+    zoom_start=7,
+    tiles=None,
+    control_scale=True,
+)
+_add_base_layers(mapa, preferred=map_reference)
+
+if historical_result and show_last_analysis:
+    _add_image_overlay(
+        mapa,
+        historical_result["annual_gallery"][-1]["composite_png"],
+        historical_result["bbox"],
+        f"Sentinel-2 {historical_result['valid_years'][-1]} · último análisis",
+        show=True,
+    )
+
+saved_geometry = st.session_state.get("aoi_geometry")
+if saved_geometry:
+    folium.GeoJson(
+        {"type": "Feature", "properties": {}, "geometry": saved_geometry},
+        name="Polígono de estudio guardado",
+        style_function=lambda _: {
+            "color": "#1683ff",
+            "weight": 3,
+            "fillColor": "#1683ff",
+            "fillOpacity": 0.10,
+        },
+    ).add_to(mapa)
+
 Draw(
     export=False,
     draw_options={
@@ -72,411 +214,374 @@ Draw(
 Fullscreen().add_to(mapa)
 MeasureControl().add_to(mapa)
 folium.LayerControl(collapsed=False).add_to(mapa)
-map_state = st_folium(mapa, height=520, width="stretch", key="mapa_anomalias")
 
-
-def bbox_from_drawing(state):
-    drawing = state.get("last_active_drawing") if state else None
-    if not drawing or not drawing.get("geometry"):
-        return None
-    geometry = drawing["geometry"]
-    coordinates = geometry.get("coordinates", [])
-    points = coordinates[0] if geometry.get("type") == "Polygon" and coordinates else []
-    if not points:
-        return None
-    lons = [point[0] for point in points]
-    lats = [point[1] for point in points]
-    return [min(lons), min(lats), max(lons), max(lats)]
-
-
-bbox = bbox_from_drawing(map_state)
-if bbox:
-    st.success(
-        f"Área marcada correctamente. Límites: {bbox[1]:.5f}, {bbox[0]:.5f} → "
-        f"{bbox[3]:.5f}, {bbox[2]:.5f}"
-    )
-else:
-    st.info("Utilice la herramienta de rectángulo o polígono para marcar el área.")
-
-comparison_tab, historical_tab = st.tabs(
-    ["🔎 Comparación de dos periodos", "🗓️ Serie histórica anual"]
+map_state = st_folium(
+    mapa,
+    height=540,
+    width="stretch",
+    key="mapa_historico_anual",
 )
 
+new_geometry = _geometry_from_state(map_state)
+if new_geometry:
+    st.session_state["aoi_geometry"] = new_geometry
 
-def show_scene_gallery(scene_previews, key_prefix: str, year_filter=None):
-    previews = scene_previews
-    if year_filter not in (None, "Todos"):
-        previews = [row for row in previews if row.get("year") == int(year_filter)]
-    if not previews:
-        st.info("No hay vistas de escenas disponibles para este filtro.")
-        return
-    st.caption(
-        f"Se muestran {len(previews)} escenas utilizadas. Cada vista corresponde al recorte exacto del área marcada."
+left_status, right_status = st.columns([4, 1])
+with right_status:
+    if st.button("Borrar área", width="stretch"):
+        st.session_state.pop("aoi_geometry", None)
+        st.session_state.pop("historical_result", None)
+        st.rerun()
+
+aoi_geometry = st.session_state.get("aoi_geometry")
+bbox = _bbox_from_geometry(aoi_geometry)
+with left_status:
+    if bbox:
+        st.success(
+            "Polígono registrado. Límites de consulta: "
+            f"{bbox[1]:.5f}, {bbox[0]:.5f} → {bbox[3]:.5f}, {bbox[2]:.5f}"
+        )
+    else:
+        st.info("Utilice la herramienta de polígono o rectángulo para delimitar el área.")
+
+st.subheader("2. Configure la serie histórica anual")
+st.markdown(
+    "Seleccione la misma temporada para cada año. Comparar, por ejemplo, junio–julio en toda "
+    "la serie reduce falsos cambios producidos por lluvia, sequía o ciclos agrícolas."
+)
+
+c1, c2, c3, c4 = st.columns(4)
+start_year = c1.number_input(
+    "Año inicial",
+    min_value=ARCHIVE_START_YEAR,
+    max_value=date.today().year,
+    value=ARCHIVE_START_YEAR,
+    step=1,
+)
+end_year = c2.number_input(
+    "Año final",
+    min_value=ARCHIVE_START_YEAR,
+    max_value=date.today().year,
+    value=date.today().year,
+    step=1,
+)
+window_start = c3.date_input(
+    "Inicio de ventana anual",
+    date(2024, 6, 1),
+    key="hist_window_start",
+)
+window_end = c4.date_input(
+    "Fin de ventana anual",
+    date(2024, 7, 31),
+    key="hist_window_end",
+)
+
+c5, c6, c7 = st.columns(3)
+max_cloud = c5.slider(
+    "Nubosidad máxima por escena", 5, 80, 35, 5, key="hist_cloud"
+)
+scenes_per_year = c6.slider(
+    "Escenas máximas por año", 1, 6, 3, 1, key="hist_scenes"
+)
+threshold = c7.slider(
+    "Sensibilidad de anomalía", 0.10, 0.50, 0.24, 0.01, key="hist_threshold"
+)
+
+years_requested = int(end_year) - int(start_year) + 1
+st.caption(
+    f"Procesamiento estimado: {years_requested} años × hasta {scenes_per_year} escenas = "
+    f"máximo aproximado de {max(years_requested, 0) * scenes_per_year} escenas."
+)
+
+run_history = st.button(
+    "🗓️ Analizar la serie histórica anual",
+    type="primary",
+    width="stretch",
+    disabled=bbox is None or aoi_geometry is None,
+)
+
+if run_history:
+    progress = st.progress(0, text="Preparando análisis histórico…")
+
+    def update_progress(value: float, message: str) -> None:
+        progress.progress(min(max(value, 0.0), 1.0), text=message)
+
+    try:
+        result = analyze_historical_series(
+            bbox=bbox,
+            aoi_geometry=aoi_geometry,
+            start_year=int(start_year),
+            end_year=int(end_year),
+            window_start=window_start,
+            window_end=window_end,
+            max_cloud=max_cloud,
+            scenes_per_year=scenes_per_year,
+            threshold=threshold,
+            progress_callback=update_progress,
+        )
+        st.session_state["historical_result"] = result
+        historical_result = result
+        progress.progress(1.0, text="Serie histórica terminada")
+    except Exception as exc:
+        progress.empty()
+        st.error(f"No fue posible completar la serie histórica: {exc}")
+
+historical_result = st.session_state.get("historical_result")
+if historical_result:
+    st.divider()
+    st.subheader("3. Resultado de la serie histórica")
+    strongest = historical_result["strongest_transition"]
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Área exacta", f"{historical_result['area_km2']:.3f} km²")
+    m2.metric("Años válidos", len(historical_result["valid_years"]))
+    m3.metric("Escenas utilizadas", len(historical_result["scene_previews"]))
+    m4.metric("Mayor transición", strongest["transition"])
+    m5.metric("Cambio máximo", f"{strongest['changed_pct']:.1f}%")
+    st.info(historical_result["interpretation"])
+
+    summary_tab, annual_tab, scenes_tab, technical_tab = st.tabs(
+        [
+            "Evolución y mayor cambio",
+            "Mosaicos de todos los años",
+            "Imágenes utilizadas",
+            "Tablas técnicas",
+        ]
     )
-    columns = st.columns(3)
-    for index, scene in enumerate(previews):
-        dt = (scene.get("datetime") or "Sin fecha")[:10]
-        period = scene.get("periodo") or str(scene.get("year", ""))
-        cloud = scene.get("cloud_cover", 0)
-        valid = scene.get("valid_coverage_pct", 0)
-        caption = (
-            f"{period} · {dt}\n"
-            f"Nubes catálogo: {cloud:.1f}% · Cobertura útil: {valid:.1f}%\n"
-            f"{scene.get('scene_id', '')}"
+
+    with summary_tab:
+        st.markdown("### Evolución de los índices espectrales")
+        annual_chart = historical_result["annual"].set_index("year")
+        st.line_chart(
+            annual_chart[["mean_ndvi", "mean_ndmi", "mean_nbr", "mean_bsi"]],
+            width="stretch",
         )
-        columns[index % 3].image(scene["preview_png"], caption=caption, width="stretch")
+        st.markdown("### Cambio detectado entre años consecutivos")
+        transition_chart = historical_result["transitions"].set_index("transition")
+        st.bar_chart(transition_chart[["changed_pct"]], width="stretch")
 
-
-with comparison_tab:
-    st.subheader("2A. Seleccione dos periodos comparables")
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Periodo anterior (ANTES)**")
-        start_a = st.date_input(
-            "Inicio anterior", date.today() - timedelta(days=365 * 3 + 60), key="ab_start_a"
+        st.markdown(f"### Transición prioritaria: {strongest['transition']}")
+        before, after = st.columns(2)
+        before.image(
+            historical_result["strongest_assets"]["before_png"],
+            caption=f"Antes · {strongest['from_year']}",
+            width="stretch",
         )
-        end_a = st.date_input(
-            "Fin anterior", date.today() - timedelta(days=365 * 3), key="ab_end_a"
+        after.image(
+            historical_result["strongest_assets"]["after_png"],
+            caption=f"Después · {strongest['to_year']}",
+            width="stretch",
         )
-    with right:
-        st.markdown("**Periodo reciente (DESPUÉS)**")
-        start_b = st.date_input(
-            "Inicio reciente", date.today() - timedelta(days=60), key="ab_start_b"
+        score_col, anomaly_col = st.columns(2)
+        score_col.image(
+            historical_result["strongest_assets"]["score_png"],
+            caption="Puntuación multiespectral",
+            width="stretch",
         )
-        end_b = st.date_input("Fin reciente", date.today(), key="ab_end_b")
-
-    c1, c2, c3 = st.columns(3)
-    max_cloud = c1.slider("Nubosidad máxima por escena", 5, 80, 35, 5, key="ab_cloud")
-    scenes = c2.slider("Escenas máximas por periodo", 2, 12, 8, key="ab_scenes")
-    threshold = c3.slider(
-        "Sensibilidad de anomalía", 0.10, 0.50, 0.24, 0.01, key="ab_threshold"
-    )
-
-    run = st.button(
-        "🔎 Analizar cambios entre los dos periodos",
-        type="primary",
-        width="stretch",
-        disabled=bbox is None,
-        key="run_ab",
-    )
-    if run:
-        try:
-            with st.status("Procesando imágenes Sentinel-2…", expanded=True) as status:
-                st.write("Buscando escenas candidatas y seleccionando las de menor nubosidad…")
-                result = analyze_change(
-                    bbox,
-                    start_a,
-                    end_a,
-                    start_b,
-                    end_b,
-                    max_cloud,
-                    scenes,
-                    threshold=threshold,
-                )
-                st.session_state["analysis_result"] = result
-                status.update(label="Análisis terminado", state="complete")
-        except Exception as exc:
-            st.error(f"No fue posible completar el análisis: {exc}")
-
-    result = st.session_state.get("analysis_result")
-    if result:
-        st.divider()
-        st.subheader("Resultados de la comparación A/B")
-        a, b, c, d = st.columns(4)
-        a.metric("Área analizada", f"{result['area_km2']:.3f} km²")
-        b.metric("Área priorizada", f"{result['changed_pct']:.1f}%")
-        c.metric("Superficie priorizada", f"{result['changed_km2']:.3f} km²")
-        d.metric("Prioridad", result["priority"])
-        st.info(result["interpretation"])
-
-        result_summary, result_gallery, result_technical = st.tabs(
-            ["Resultado visual", "Galería de escenas utilizadas", "Metadatos y exportación"]
+        anomaly_col.image(
+            historical_result["strongest_assets"]["anomaly_png"],
+            caption="Áreas priorizadas",
+            width="stretch",
         )
-        with result_summary:
-            before, after = st.columns(2)
-            before.image(result["before_png"], caption="ANTES · mosaico de varias escenas", width="stretch")
-            after.image(result["after_png"], caption="DESPUÉS · mosaico de varias escenas", width="stretch")
-            score_col, anomaly_col = st.columns(2)
-            score_col.image(result["score_png"], caption="Puntuación combinada de cambio", width="stretch")
-            anomaly_col.image(result["anomaly_png"], caption="Zonas priorizadas", width="stretch")
 
-            st.markdown("### Polígonos detectados")
-            result_map = folium.Map(
-                location=[
-                    (result["bbox"][1] + result["bbox"][3]) / 2,
-                    (result["bbox"][0] + result["bbox"][2]) / 2,
-                ],
-                zoom_start=15,
-                tiles=None,
+    with annual_tab:
+        st.markdown("### Línea visual anual")
+        st.caption(
+            "Cada imagen es un mosaico mediano construido con las escenas válidas de la misma ventana estacional."
+        )
+        annual_columns = st.columns(3)
+        for index, annual in enumerate(historical_result["annual_gallery"]):
+            cloud = annual["mean_cloud_cover"]
+            cloud_text = f"{cloud:.1f}%" if cloud is not None else "N/D"
+            caption = (
+                f"{annual['year']} · {annual['used_scenes']} escenas\n"
+                f"Nubes promedio: {cloud_text} · NDVI: {annual['mean_ndvi']:.3f} · "
+                f"BSI: {annual['mean_bsi']:.3f}"
             )
-            folium.TileLayer("OpenStreetMap", name="Mapa").add_to(result_map)
-            folium.TileLayer(
-                "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                attr="Esri",
-                name="Satélite",
-            ).add_to(result_map)
-            if result["geojson"]["features"]:
-                folium.GeoJson(
-                    result["geojson"],
-                    name="Áreas priorizadas",
-                    style_function=lambda _: {
-                        "color": "#ff2b2b",
-                        "weight": 3,
-                        "fillColor": "#ff2b2b",
-                        "fillOpacity": 0.30,
-                    },
-                ).add_to(result_map)
-            folium.LayerControl(collapsed=False).add_to(result_map)
-            st_folium(result_map, height=520, width="stretch", key="resultado_mapa")
-
-        with result_gallery:
-            st.markdown("### Imágenes que participaron en el análisis")
-            st.caption(
-                "No son capturas de Google Earth: son vistas en color natural generadas desde las bandas Sentinel-2 originales."
-            )
-            show_scene_gallery(result["scene_previews"], "ab_gallery")
-
-        with result_technical:
-            st.markdown("### Escenas utilizadas")
-            st.dataframe(result["scenes"], width="stretch", hide_index=True)
-            with st.expander("Escenas candidatas encontradas en el catálogo"):
-                st.dataframe(result["candidates"], width="stretch", hide_index=True)
-            if result["warnings"]:
-                st.warning("Algunas escenas candidatas fueron descartadas.")
-                st.code("\n".join(result["warnings"][:30]))
-
-            st.markdown("### Exportar")
-            e1, e2, e3, e4 = st.columns(4)
-            e1.download_button(
-                "Informe Excel",
-                report_excel(result),
-                "sentinel_iat_resultado.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch",
-            )
-            e2.download_button(
-                "Paquete visual ZIP",
-                comparison_gallery_zip(result),
-                "sentinel_iat_evidencia_visual.zip",
-                "application/zip",
-                width="stretch",
-            )
-            e3.download_button(
-                "Anomalías GeoJSON",
-                json.dumps(result["geojson"], ensure_ascii=False, indent=2),
-                "sentinel_iat_anomalias.geojson",
-                "application/geo+json",
-                width="stretch",
-            )
-            e4.download_button(
-                "Metadatos JSON",
-                json.dumps(result["metadata"], ensure_ascii=False, indent=2),
-                "sentinel_iat_metadatos.json",
-                "application/json",
-                width="stretch",
+            annual_columns[index % 3].image(
+                annual["composite_png"], caption=caption, width="stretch"
             )
 
-with historical_tab:
-    st.subheader("2B. Construya la serie histórica completa")
+    with scenes_tab:
+        year_options = ["Todos"] + [
+            str(year) for year in historical_result["valid_years"]
+        ]
+        selected_year = st.selectbox(
+            "Filtrar imágenes por año", year_options, key="scene_year_filter"
+        )
+        _show_scene_gallery(historical_result["scene_previews"], selected_year)
+
+    with technical_tab:
+        st.markdown("### Serie anual")
+        st.dataframe(historical_result["annual"], width="stretch", hide_index=True)
+        st.markdown("### Transiciones interanuales")
+        st.dataframe(
+            historical_result["transitions"], width="stretch", hide_index=True
+        )
+        with st.expander("Escenas candidatas encontradas"):
+            st.dataframe(
+                historical_result["candidates"], width="stretch", hide_index=True
+            )
+        if historical_result["missing_years"]:
+            st.warning(
+                "No fue posible construir mosaicos para: "
+                + ", ".join(map(str, historical_result["missing_years"]))
+            )
+        if historical_result["warnings"]:
+            with st.expander("Advertencias técnicas"):
+                st.code("\n".join(historical_result["warnings"][:100]))
+
+    st.divider()
+    st.subheader("4. Mapa final de polígonos y exportación KMZ")
     st.markdown(
-        "Elija una **misma ventana estacional** para todos los años. Comparar junio–julio de cada año, "
-        "por ejemplo, reduce falsos cambios causados únicamente por estaciones distintas."
+        "El mapa combina el polígono exacto de consulta, las anomalías acumuladas y las "
+        "anomalías de cada transición anual. Use el control de capas para activar o desactivar cada año."
     )
 
-    h1, h2, h3, h4 = st.columns(4)
-    start_year = h1.number_input(
-        "Año inicial", min_value=ARCHIVE_START_YEAR, max_value=date.today().year, value=ARCHIVE_START_YEAR, step=1
-    )
-    end_year = h2.number_input(
-        "Año final", min_value=ARCHIVE_START_YEAR, max_value=date.today().year, value=date.today().year, step=1
-    )
-    reference_start = h3.date_input(
-        "Inicio de ventana anual", date(2024, 6, 1), key="hist_window_start"
-    )
-    reference_end = h4.date_input(
-        "Fin de ventana anual", date(2024, 7, 31), key="hist_window_end"
+    first_year = historical_result["valid_years"][0]
+    last_year = historical_result["valid_years"][-1]
+    final_reference = st.selectbox(
+        "Vista inicial del mapa final",
+        [
+            f"Sentinel-2 {last_year}",
+            f"Sentinel-2 {first_year}",
+            "Esri World Imagery",
+            "OpenStreetMap",
+        ],
     )
 
-    h5, h6, h7 = st.columns(3)
-    historical_cloud = h5.slider(
-        "Nubosidad máxima histórica", 5, 80, 35, 5, key="hist_cloud"
+    bbox_result = historical_result["bbox"]
+    center = [
+        (bbox_result[1] + bbox_result[3]) / 2,
+        (bbox_result[0] + bbox_result[2]) / 2,
+    ]
+    final_map = folium.Map(location=center, zoom_start=15, tiles=None, control_scale=True)
+    preferred_base = (
+        "OpenStreetMap" if final_reference == "OpenStreetMap" else "Esri World Imagery"
     )
-    scenes_per_year = h6.slider(
-        "Escenas máximas por año", 1, 6, 3, 1, key="hist_scenes"
+    _add_base_layers(final_map, preferred=preferred_base)
+
+    first_overlay_show = final_reference == f"Sentinel-2 {first_year}"
+    last_overlay_show = final_reference == f"Sentinel-2 {last_year}"
+    _add_image_overlay(
+        final_map,
+        historical_result["annual_gallery"][0]["composite_png"],
+        bbox_result,
+        f"Sentinel-2 {first_year} · mosaico utilizado",
+        show=first_overlay_show,
     )
-    historical_threshold = h7.slider(
-        "Sensibilidad histórica", 0.10, 0.50, 0.24, 0.01, key="hist_threshold"
+    _add_image_overlay(
+        final_map,
+        historical_result["annual_gallery"][-1]["composite_png"],
+        bbox_result,
+        f"Sentinel-2 {last_year} · mosaico utilizado",
+        show=last_overlay_show,
     )
 
-    years_requested = int(end_year) - int(start_year) + 1
-    st.caption(
-        f"Solicitud: {years_requested} años × hasta {scenes_per_year} escenas = "
-        f"máximo aproximado de {years_requested * scenes_per_year} escenas procesadas."
-    )
+    folium.GeoJson(
+        {
+            "type": "Feature",
+            "properties": {"nombre": "Área exacta analizada"},
+            "geometry": historical_result.get("aoi_geometry"),
+        },
+        name="Área exacta analizada",
+        style_function=lambda _: {
+            "color": "#1683ff",
+            "weight": 4,
+            "fillColor": "#1683ff",
+            "fillOpacity": 0.08,
+        },
+        tooltip=folium.GeoJsonTooltip(fields=["nombre"], aliases=["Capa:"]),
+        show=True,
+    ).add_to(final_map)
 
-    run_history = st.button(
-        "🗓️ Analizar toda la serie histórica",
+    accumulated = historical_result["accumulated_geojson"]
+    if accumulated.get("features"):
+        folium.GeoJson(
+            accumulated,
+            name=f"Anomalías acumuladas {first_year}-{last_year}",
+            style_function=lambda _: {
+                "color": "#ff2020",
+                "weight": 3,
+                "fillColor": "#ff2020",
+                "fillOpacity": 0.32,
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=["clasificacion", "area_m2", "area_ha"],
+                aliases=["Clasificación:", "Área m²:", "Área ha:"],
+                localize=True,
+            ),
+            show=True,
+        ).add_to(final_map)
+
+    strongest_label = historical_result["strongest_transition"]["transition"]
+    for label, geojson in historical_result.get("transition_geojsons", {}).items():
+        if not geojson.get("features"):
+            continue
+        is_strongest = label == strongest_label
+        folium.GeoJson(
+            geojson,
+            name=("★ Mayor cambio · " if is_strongest else "Cambio · ") + label,
+            style_function=(
+                (lambda _: {
+                    "color": "#ffd000",
+                    "weight": 4,
+                    "fillColor": "#ffd000",
+                    "fillOpacity": 0.28,
+                })
+                if is_strongest
+                else (lambda _: {
+                    "color": "#ff8c00",
+                    "weight": 2,
+                    "fillColor": "#ff8c00",
+                    "fillOpacity": 0.18,
+                })
+            ),
+            tooltip=folium.GeoJsonTooltip(
+                fields=["transition", "area_m2", "area_ha"],
+                aliases=["Transición:", "Área m²:", "Área ha:"],
+                localize=True,
+            ),
+            show=is_strongest,
+        ).add_to(final_map)
+
+    folium.LayerControl(collapsed=False).add_to(final_map)
+    Fullscreen().add_to(final_map)
+    MeasureControl().add_to(final_map)
+    final_map.fit_bounds(
+        [[bbox_result[1], bbox_result[0]], [bbox_result[3], bbox_result[2]]]
+    )
+    st_folium(final_map, height=620, width="stretch", key="mapa_final_historico")
+
+    st.markdown("### Exportar resultado")
+    e1, e2, e3 = st.columns(3)
+    e1.download_button(
+        "🌎 Exportar polígonos a KMZ",
+        historical_kmz(historical_result),
+        f"sentinel_iat_serie_historica_{first_year}_{last_year}.kmz",
+        "application/vnd.google-earth.kmz",
         type="primary",
         width="stretch",
-        disabled=bbox is None,
-        key="run_history",
+        help=(
+            "Incluye el área exacta, anomalías acumuladas y carpetas por transición anual para Google Earth."
+        ),
     )
-    if run_history:
-        progress = st.progress(0, text="Preparando análisis histórico…")
-
-        def update_progress(value: float, message: str):
-            progress.progress(min(max(value, 0.0), 1.0), text=message)
-
-        try:
-            historical_result = analyze_historical_series(
-                bbox=bbox,
-                start_year=int(start_year),
-                end_year=int(end_year),
-                window_start=reference_start,
-                window_end=reference_end,
-                max_cloud=historical_cloud,
-                scenes_per_year=scenes_per_year,
-                threshold=historical_threshold,
-                progress_callback=update_progress,
-            )
-            st.session_state["historical_result"] = historical_result
-            progress.progress(1.0, text="Serie histórica terminada")
-        except Exception as exc:
-            progress.empty()
-            st.error(f"No fue posible completar la serie histórica: {exc}")
-
-    historical_result = st.session_state.get("historical_result")
-    if historical_result:
-        st.divider()
-        st.subheader("Resultados históricos")
-        strongest = historical_result["strongest_transition"]
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Años con mosaico", len(historical_result["valid_years"]))
-        m2.metric("Escenas utilizadas", len(historical_result["scene_previews"]))
-        m3.metric("Mayor transición", strongest["transition"])
-        m4.metric("Cambio máximo", f"{strongest['changed_pct']:.1f}%")
-        st.info(historical_result["interpretation"])
-
-        history_summary, annual_gallery_tab, scene_gallery_tab, history_export = st.tabs(
-            [
-                "Evolución y mayor cambio",
-                "Mosaicos de todos los años",
-                "Todas las escenas utilizadas",
-                "Metadatos y exportación",
-            ]
-        )
-
-        with history_summary:
-            st.markdown("### Evolución de índices por año")
-            annual_chart = historical_result["annual"].set_index("year")
-            st.line_chart(
-                annual_chart[["mean_ndvi", "mean_ndmi", "mean_nbr", "mean_bsi"]],
-                width="stretch",
-            )
-            st.markdown("### Proporción de cambio entre años consecutivos disponibles")
-            transition_chart = historical_result["transitions"].set_index("transition")
-            st.bar_chart(transition_chart[["changed_pct"]], width="stretch")
-
-            st.markdown(f"### Transición prioritaria: {strongest['transition']}")
-            sb, sa = st.columns(2)
-            sb.image(
-                historical_result["strongest_assets"]["before_png"],
-                caption=f"Antes · {strongest['from_year']}",
-                width="stretch",
-            )
-            sa.image(
-                historical_result["strongest_assets"]["after_png"],
-                caption=f"Después · {strongest['to_year']}",
-                width="stretch",
-            )
-            ss, sm = st.columns(2)
-            ss.image(
-                historical_result["strongest_assets"]["score_png"],
-                caption="Puntuación multiespectral de la transición",
-                width="stretch",
-            )
-            sm.image(
-                historical_result["strongest_assets"]["anomaly_png"],
-                caption="Áreas priorizadas de la transición",
-                width="stretch",
-            )
-
-        with annual_gallery_tab:
-            st.markdown("### Línea visual anual")
-            st.caption(
-                "Cada tarjeta es el mosaico mediano de las escenas válidas del mismo periodo estacional de ese año."
-            )
-            annual_columns = st.columns(3)
-            for index, annual in enumerate(historical_result["annual_gallery"]):
-                cloud = annual["mean_cloud_cover"]
-                cloud_text = f"{cloud:.1f}%" if cloud is not None else "N/D"
-                caption = (
-                    f"{annual['year']} · {annual['used_scenes']} escenas\n"
-                    f"Nubes promedio: {cloud_text} · NDVI: {annual['mean_ndvi']:.3f} · BSI: {annual['mean_bsi']:.3f}"
-                )
-                annual_columns[index % 3].image(
-                    annual["composite_png"], caption=caption, width="stretch"
-                )
-
-        with scene_gallery_tab:
-            years_options = ["Todos"] + [str(year) for year in historical_result["valid_years"]]
-            selected_year = st.selectbox(
-                "Filtrar imágenes por año", years_options, key="scene_year_filter"
-            )
-            show_scene_gallery(
-                historical_result["scene_previews"],
-                "historical_gallery",
-                year_filter=selected_year,
-            )
-
-        with history_export:
-            st.markdown("### Serie anual")
-            st.dataframe(historical_result["annual"], width="stretch", hide_index=True)
-            st.markdown("### Transiciones interanuales")
-            st.dataframe(historical_result["transitions"], width="stretch", hide_index=True)
-            with st.expander("Escenas candidatas encontradas"):
-                st.dataframe(historical_result["candidates"], width="stretch", hide_index=True)
-            if historical_result["missing_years"]:
-                st.warning(
-                    "No fue posible construir mosaicos para: "
-                    + ", ".join(map(str, historical_result["missing_years"]))
-                )
-            if historical_result["warnings"]:
-                with st.expander("Advertencias técnicas"):
-                    st.code("\n".join(historical_result["warnings"][:100]))
-
-            x1, x2, x3, x4 = st.columns(4)
-            x1.download_button(
-                "Informe histórico Excel",
-                historical_report_excel(historical_result),
-                "sentinel_iat_serie_historica.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch",
-            )
-            x2.download_button(
-                "Paquete histórico ZIP",
-                historical_gallery_zip(historical_result),
-                "sentinel_iat_evidencia_historica.zip",
-                "application/zip",
-                width="stretch",
-            )
-            x3.download_button(
-                "Resumen visual PNG",
-                historical_result["historical_overview_png"],
-                "sentinel_iat_resumen_historico.png",
-                "image/png",
-                width="stretch",
-            )
-            x4.download_button(
-                "Metadatos JSON",
-                json.dumps(historical_result["metadata"], ensure_ascii=False, indent=2),
-                "sentinel_iat_historico_metadatos.json",
-                "application/json",
-                width="stretch",
-            )
+    e2.download_button(
+        "📊 Informe histórico Excel",
+        historical_report_excel(historical_result),
+        f"sentinel_iat_serie_historica_{first_year}_{last_year}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        width="stretch",
+    )
+    e3.download_button(
+        "📦 Paquete completo ZIP",
+        historical_gallery_zip(historical_result),
+        f"sentinel_iat_evidencia_historica_{first_year}_{last_year}.zip",
+        "application/zip",
+        width="stretch",
+    )
 
 st.divider()
 st.caption(
-    "Fuente de consulta: Microsoft Planetary Computer STAC · colección sentinel-2-l2a. "
-    "Las escenas son datos Copernicus Sentinel-2 procesados a reflectancia de superficie."
+    "Fuente analítica: Microsoft Planetary Computer STAC · colección sentinel-2-l2a · "
+    "datos Copernicus Sentinel-2 de reflectancia de superficie. Esri y OpenStreetMap se usan únicamente como referencia cartográfica."
 )

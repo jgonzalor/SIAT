@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import json
 import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import date
 from io import BytesIO
@@ -17,16 +18,20 @@ import rasterio
 from PIL import Image
 from pystac_client import Client
 from rasterio.enums import Resampling
-from rasterio.features import shapes
+from rasterio.features import geometry_mask, shapes
 from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.warp import transform_bounds
 from rasterio.windows import from_bounds
+from pyproj import Geod
 from shapely.geometry import mapping, shape
 from shapely.ops import unary_union
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "sentinel-2-l2a"
 ARCHIVE_START_YEAR = 2016
+GEOD = Geod(ellps="WGS84")
+KML_NS = "http://www.opengis.net/kml/2.2"
+ET.register_namespace("", KML_NS)
 
 
 @dataclass
@@ -137,6 +142,28 @@ def _output_shape(bbox: list[float], max_size: int) -> tuple[int, int]:
     return height, width
 
 
+def _aoi_outside_mask(
+    bbox: list[float],
+    out_shape: tuple[int, int],
+    aoi_geometry: dict[str, Any] | None,
+) -> np.ndarray:
+    """Devuelve True fuera del polígono de estudio y False en su interior."""
+    if not aoi_geometry:
+        return np.zeros(out_shape, dtype=bool)
+    height, width = out_shape
+    transform = transform_from_bounds(*bbox, width, height)
+    inside = geometry_mask(
+        [aoi_geometry],
+        out_shape=out_shape,
+        transform=transform,
+        invert=True,
+        all_touched=False,
+    )
+    if not np.any(inside):
+        raise RuntimeError("El polígono marcado no contiene píxeles analizables.")
+    return ~inside
+
+
 def _scene_arrays(
     item: Any, bbox: list[float], out_shape: tuple[int, int]
 ) -> dict[str, np.ma.MaskedArray]:
@@ -192,7 +219,15 @@ def _stretch_rgb(rgb: np.ma.MaskedArray) -> np.ma.MaskedArray:
 def _rgb_png(rgb: np.ma.MaskedArray) -> bytes:
     data = np.asarray(np.ma.filled(rgb, 0), dtype=np.float32)
     data = np.clip(data, 0, 1)
-    image = Image.fromarray((data * 255).astype(np.uint8), mode="RGB")
+    rgb_u8 = (data * 255).astype(np.uint8)
+    mask = np.ma.getmaskarray(rgb)
+    if mask.ndim == 3:
+        outside = np.all(mask, axis=2)
+    else:
+        outside = mask
+    alpha = np.where(outside, 0, 255).astype(np.uint8)
+    rgba = np.dstack((rgb_u8, alpha))
+    image = Image.fromarray(rgba, mode="RGBA")
     output = BytesIO()
     image.save(output, format="PNG", optimize=True)
     return output.getvalue()
@@ -203,8 +238,11 @@ def build_composite(
     bbox: list[float],
     out_size: int = 512,
     include_scene_previews: bool = True,
+    aoi_geometry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out_shape = _output_shape(bbox, out_size)
+    outside_aoi = _aoi_outside_mask(bbox, out_shape, aoi_geometry)
+    inside_pixels = max(int(np.count_nonzero(~outside_aoi)), 1)
     stacks: dict[str, list[np.ma.MaskedArray]] = {
         key: [] for key in ("blue", "green", "red", "nir", "swir1", "swir2")
     }
@@ -215,7 +253,15 @@ def build_composite(
     for item in items:
         try:
             data = _scene_arrays(item, bbox, out_shape)
-            valid = 100 * (1 - np.mean(np.ma.getmaskarray(data["red"])))
+            if np.any(outside_aoi):
+                data = {
+                    key: np.ma.array(value, mask=np.ma.getmaskarray(value) | outside_aoi)
+                    for key, value in data.items()
+                }
+            valid_inside = np.count_nonzero(
+                (~np.ma.getmaskarray(data["red"])) & (~outside_aoi)
+            )
+            valid = 100 * valid_inside / inside_pixels
             if valid < 25:
                 errors.append(
                     f"{item.id}: cobertura válida insuficiente ({valid:.1f}%)."
@@ -296,7 +342,12 @@ def _png_bytes(
     return bio.getvalue()
 
 
-def _area_km2(bbox: list[float]) -> float:
+def _area_km2(
+    bbox: list[float], aoi_geometry: dict[str, Any] | None = None
+) -> float:
+    if aoi_geometry:
+        area_m2, _ = GEOD.geometry_area_perimeter(shape(aoi_geometry))
+        return abs(float(area_m2)) / 1_000_000.0
     lat_mid = (bbox[1] + bbox[3]) / 2
     width_km = abs(bbox[2] - bbox[0]) * 111.32 * np.cos(np.radians(lat_mid))
     height_km = abs(bbox[3] - bbox[1]) * 110.57
@@ -345,17 +396,327 @@ def _anomaly_geojson(
     if merged and not merged.is_empty:
         parts = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
         for idx, poly in enumerate(parts, 1):
+            area_m2, _ = GEOD.geometry_area_perimeter(poly)
+            area_m2 = abs(float(area_m2))
             features.append(
                 {
                     "type": "Feature",
                     "properties": {
                         "id": idx,
                         "clasificacion": "Área prioritaria para revisión",
+                        "area_m2": area_m2,
+                        "area_ha": area_m2 / 10000.0,
                     },
                     "geometry": mapping(poly),
                 }
             )
     return {"type": "FeatureCollection", "features": features}
+
+
+
+def _kml_tag(name: str) -> str:
+    return f"{{{KML_NS}}}{name}"
+
+
+def _kml_coordinates(ring: list[list[float]] | tuple[tuple[float, ...], ...]) -> str:
+    coordinates = []
+    for point in ring:
+        if len(point) < 2:
+            continue
+        lon, lat = float(point[0]), float(point[1])
+        altitude = float(point[2]) if len(point) > 2 else 0.0
+        coordinates.append(f"{lon:.8f},{lat:.8f},{altitude:.2f}")
+    return " ".join(coordinates)
+
+
+def _append_kml_polygon(parent: ET.Element, coordinates: Any) -> None:
+    polygon = ET.SubElement(parent, _kml_tag("Polygon"))
+    ET.SubElement(polygon, _kml_tag("tessellate")).text = "1"
+    ET.SubElement(polygon, _kml_tag("altitudeMode")).text = "clampToGround"
+
+    if not coordinates:
+        return
+    outer = ET.SubElement(polygon, _kml_tag("outerBoundaryIs"))
+    outer_ring = ET.SubElement(outer, _kml_tag("LinearRing"))
+    ET.SubElement(outer_ring, _kml_tag("coordinates")).text = _kml_coordinates(
+        coordinates[0]
+    )
+
+    for inner_coords in coordinates[1:]:
+        inner = ET.SubElement(polygon, _kml_tag("innerBoundaryIs"))
+        inner_ring = ET.SubElement(inner, _kml_tag("LinearRing"))
+        ET.SubElement(inner_ring, _kml_tag("coordinates")).text = _kml_coordinates(
+            inner_coords
+        )
+
+
+def _append_kml_geometry(parent: ET.Element, geometry: dict[str, Any]) -> None:
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates") or []
+    if geometry_type == "Polygon":
+        _append_kml_polygon(parent, coordinates)
+    elif geometry_type == "MultiPolygon":
+        multi = ET.SubElement(parent, _kml_tag("MultiGeometry"))
+        for polygon_coords in coordinates:
+            _append_kml_polygon(multi, polygon_coords)
+    else:
+        raise ValueError(f"Geometría no compatible con KMZ: {geometry_type}")
+
+
+def _append_extended_data(parent: ET.Element, values: dict[str, Any]) -> None:
+    clean_values: dict[str, str] = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            serialized = json.dumps(value, ensure_ascii=False, default=str)
+        else:
+            serialized = str(value)
+        clean_values[str(key)] = serialized
+    if not clean_values:
+        return
+    extended = ET.SubElement(parent, _kml_tag("ExtendedData"))
+    for key, value in clean_values.items():
+        data = ET.SubElement(extended, _kml_tag("Data"), {"name": key})
+        ET.SubElement(data, _kml_tag("value")).text = value
+
+
+def geojson_to_kmz(
+    geojson: dict[str, Any],
+    bbox: list[float],
+    document_name: str,
+    description: str,
+    metadata: dict[str, Any] | None = None,
+    aoi_geometry: dict[str, Any] | None = None,
+) -> bytes:
+    """Convierte las áreas priorizadas a un KMZ autocontenido para Google Earth."""
+    root = ET.Element(_kml_tag("kml"))
+    document = ET.SubElement(root, _kml_tag("Document"))
+    ET.SubElement(document, _kml_tag("name")).text = document_name
+    ET.SubElement(document, _kml_tag("open")).text = "1"
+    ET.SubElement(document, _kml_tag("visibility")).text = "1"
+    ET.SubElement(document, _kml_tag("description")).text = description
+    _append_extended_data(document, metadata or {})
+
+    anomaly_style = ET.SubElement(document, _kml_tag("Style"), {"id": "anomalyStyle"})
+    anomaly_line = ET.SubElement(anomaly_style, _kml_tag("LineStyle"))
+    ET.SubElement(anomaly_line, _kml_tag("color")).text = "ff0000ff"
+    ET.SubElement(anomaly_line, _kml_tag("width")).text = "3"
+    anomaly_poly = ET.SubElement(anomaly_style, _kml_tag("PolyStyle"))
+    ET.SubElement(anomaly_poly, _kml_tag("color")).text = "660000ff"
+    ET.SubElement(anomaly_poly, _kml_tag("fill")).text = "1"
+    ET.SubElement(anomaly_poly, _kml_tag("outline")).text = "1"
+
+    aoi_style = ET.SubElement(document, _kml_tag("Style"), {"id": "aoiStyle"})
+    aoi_line = ET.SubElement(aoi_style, _kml_tag("LineStyle"))
+    ET.SubElement(aoi_line, _kml_tag("color")).text = "ffff0000"
+    ET.SubElement(aoi_line, _kml_tag("width")).text = "2"
+    aoi_poly = ET.SubElement(aoi_style, _kml_tag("PolyStyle"))
+    ET.SubElement(aoi_poly, _kml_tag("color")).text = "180000ff"
+    ET.SubElement(aoi_poly, _kml_tag("fill")).text = "1"
+    ET.SubElement(aoi_poly, _kml_tag("outline")).text = "1"
+
+    area_folder = ET.SubElement(document, _kml_tag("Folder"))
+    ET.SubElement(area_folder, _kml_tag("name")).text = "Área analizada"
+    ET.SubElement(area_folder, _kml_tag("open")).text = "0"
+    area_placemark = ET.SubElement(area_folder, _kml_tag("Placemark"))
+    ET.SubElement(area_placemark, _kml_tag("name")).text = "Polígono de consulta"
+    ET.SubElement(area_placemark, _kml_tag("styleUrl")).text = "#aoiStyle"
+    if aoi_geometry:
+        _append_kml_geometry(area_placemark, aoi_geometry)
+    else:
+        west, south, east, north = map(float, bbox)
+        bbox_ring = [
+            [west, south, 0],
+            [east, south, 0],
+            [east, north, 0],
+            [west, north, 0],
+            [west, south, 0],
+        ]
+        _append_kml_polygon(area_placemark, [bbox_ring])
+
+    anomaly_folder = ET.SubElement(document, _kml_tag("Folder"))
+    ET.SubElement(anomaly_folder, _kml_tag("name")).text = "Áreas priorizadas"
+    ET.SubElement(anomaly_folder, _kml_tag("open")).text = "1"
+    ET.SubElement(anomaly_folder, _kml_tag("visibility")).text = "1"
+
+    features = geojson.get("features", [])
+    if not features:
+        empty_placemark = ET.SubElement(anomaly_folder, _kml_tag("Placemark"))
+        ET.SubElement(empty_placemark, _kml_tag("name")).text = (
+            "Sin polígonos por encima del umbral"
+        )
+        ET.SubElement(empty_placemark, _kml_tag("description")).text = (
+            "El análisis no generó áreas priorizadas con la sensibilidad seleccionada."
+        )
+    else:
+        for index, feature in enumerate(features, 1):
+            properties = dict(feature.get("properties") or {})
+            placemark = ET.SubElement(anomaly_folder, _kml_tag("Placemark"))
+            placemark_name = f"Anomalía {properties.get('id', index)}"
+            area_ha = properties.get("area_ha")
+            if isinstance(area_ha, (int, float)):
+                placemark_name += f" · {area_ha:.3f} ha"
+            ET.SubElement(placemark, _kml_tag("name")).text = placemark_name
+            ET.SubElement(placemark, _kml_tag("visibility")).text = "1"
+            ET.SubElement(placemark, _kml_tag("styleUrl")).text = "#anomalyStyle"
+            ET.SubElement(placemark, _kml_tag("description")).text = str(
+                properties.get("clasificacion", "Área prioritaria para revisión")
+            )
+            _append_extended_data(placemark, properties)
+            _append_kml_geometry(placemark, feature.get("geometry") or {})
+
+    kml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("doc.kml", kml_bytes)
+    return output.getvalue()
+
+
+def comparison_kmz(result: dict[str, Any]) -> bytes:
+    metadata = {
+        **_clean_metadata(result.get("metadata", {})),
+        "area_analizada_km2": round(float(result["area_km2"]), 6),
+        "area_priorizada_km2": round(float(result["changed_km2"]), 6),
+        "area_priorizada_pct": round(float(result["changed_pct"]), 4),
+        "prioridad": result["priority"],
+    }
+    return geojson_to_kmz(
+        result["geojson"],
+        result["bbox"],
+        "Sentinel IAT · Anomalías territoriales",
+        result["interpretation"],
+        metadata,
+        aoi_geometry=result.get("aoi_geometry"),
+    )
+
+
+def historical_kmz(result: dict[str, Any]) -> bytes:
+    """Exporta el AOI exacto, anomalías acumuladas y transiciones anuales a KMZ."""
+    strongest = result["strongest_transition"]
+    years = result.get("valid_years", [])
+    year_label = f"{years[0]}-{years[-1]}" if years else "serie histórica"
+    metadata = {
+        **_clean_metadata(result.get("metadata", {})),
+        "area_analizada_km2": round(float(result["area_km2"]), 6),
+        "transicion_mayor": strongest["transition"],
+        "cambio_maximo_pct": round(float(strongest["changed_pct"]), 4),
+        "cambio_acumulado_pct": round(float(result["accumulated_changed_pct"]), 4),
+    }
+
+    root = ET.Element(_kml_tag("kml"))
+    document = ET.SubElement(root, _kml_tag("Document"))
+    ET.SubElement(document, _kml_tag("name")).text = (
+        f"Sentinel IAT · Serie histórica {year_label}"
+    )
+    ET.SubElement(document, _kml_tag("open")).text = "1"
+    ET.SubElement(document, _kml_tag("visibility")).text = "1"
+    ET.SubElement(document, _kml_tag("description")).text = result["interpretation"]
+    _append_extended_data(document, metadata)
+
+    def add_style(style_id: str, line_color: str, fill_color: str, width: str = "3"):
+        style = ET.SubElement(document, _kml_tag("Style"), {"id": style_id})
+        line = ET.SubElement(style, _kml_tag("LineStyle"))
+        ET.SubElement(line, _kml_tag("color")).text = line_color
+        ET.SubElement(line, _kml_tag("width")).text = width
+        poly = ET.SubElement(style, _kml_tag("PolyStyle"))
+        ET.SubElement(poly, _kml_tag("color")).text = fill_color
+        ET.SubElement(poly, _kml_tag("fill")).text = "1"
+        ET.SubElement(poly, _kml_tag("outline")).text = "1"
+
+    # KML usa AABBGGRR.
+    add_style("aoiStyle", "ffff0000", "220000ff", "2")
+    add_style("accumulatedStyle", "ff0000ff", "660000ff", "3")
+    add_style("transitionStyle", "ff00a5ff", "5500a5ff", "2")
+    add_style("strongestStyle", "ff00ffff", "6600ffff", "4")
+
+    area_folder = ET.SubElement(document, _kml_tag("Folder"))
+    ET.SubElement(area_folder, _kml_tag("name")).text = "01 · Área exacta analizada"
+    ET.SubElement(area_folder, _kml_tag("open")).text = "0"
+    area_placemark = ET.SubElement(area_folder, _kml_tag("Placemark"))
+    ET.SubElement(area_placemark, _kml_tag("name")).text = "Polígono de consulta"
+    ET.SubElement(area_placemark, _kml_tag("visibility")).text = "1"
+    ET.SubElement(area_placemark, _kml_tag("styleUrl")).text = "#aoiStyle"
+    aoi_geometry = result.get("aoi_geometry")
+    if aoi_geometry:
+        _append_kml_geometry(area_placemark, aoi_geometry)
+    else:
+        west, south, east, north = map(float, result["bbox"])
+        _append_kml_polygon(
+            area_placemark,
+            [[[west, south, 0], [east, south, 0], [east, north, 0],
+              [west, north, 0], [west, south, 0]]],
+        )
+
+    def append_feature_folder(
+        parent: ET.Element,
+        folder_name: str,
+        geojson: dict[str, Any],
+        style_id: str,
+        visible: bool,
+        transition: str | None = None,
+    ) -> None:
+        folder = ET.SubElement(parent, _kml_tag("Folder"))
+        ET.SubElement(folder, _kml_tag("name")).text = folder_name
+        ET.SubElement(folder, _kml_tag("open")).text = "0"
+        ET.SubElement(folder, _kml_tag("visibility")).text = "1" if visible else "0"
+        features = geojson.get("features", [])
+        if not features:
+            placemark = ET.SubElement(folder, _kml_tag("Placemark"))
+            ET.SubElement(placemark, _kml_tag("name")).text = "Sin polígonos sobre el umbral"
+            ET.SubElement(placemark, _kml_tag("visibility")).text = "0"
+            return
+        for index, feature in enumerate(features, 1):
+            properties = dict(feature.get("properties") or {})
+            if transition:
+                properties.setdefault("transition", transition)
+            placemark = ET.SubElement(folder, _kml_tag("Placemark"))
+            area_ha = properties.get("area_ha")
+            name = f"Anomalía {index}"
+            if transition:
+                name = f"{transition} · {name}"
+            if isinstance(area_ha, (int, float)):
+                name += f" · {area_ha:.3f} ha"
+            ET.SubElement(placemark, _kml_tag("name")).text = name
+            ET.SubElement(placemark, _kml_tag("visibility")).text = (
+                "1" if visible else "0"
+            )
+            ET.SubElement(placemark, _kml_tag("styleUrl")).text = f"#{style_id}"
+            ET.SubElement(placemark, _kml_tag("description")).text = str(
+                properties.get("clasificacion", "Área prioritaria para revisión")
+            )
+            _append_extended_data(placemark, properties)
+            _append_kml_geometry(placemark, feature.get("geometry") or {})
+
+    append_feature_folder(
+        document,
+        f"02 · Anomalías acumuladas {year_label}",
+        result["accumulated_geojson"],
+        "accumulatedStyle",
+        True,
+    )
+
+    transitions_folder = ET.SubElement(document, _kml_tag("Folder"))
+    ET.SubElement(transitions_folder, _kml_tag("name")).text = "03 · Anomalías por transición anual"
+    ET.SubElement(transitions_folder, _kml_tag("open")).text = "0"
+    ET.SubElement(transitions_folder, _kml_tag("visibility")).text = "1"
+    strongest_label = strongest["transition"]
+    for label, geojson in result.get("transition_geojsons", {}).items():
+        is_strongest = label == strongest_label
+        append_feature_folder(
+            transitions_folder,
+            ("★ Mayor cambio · " if is_strongest else "") + label,
+            geojson,
+            "strongestStyle" if is_strongest else "transitionStyle",
+            is_strongest,
+            transition=label,
+        )
+
+    kml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("doc.kml", kml_bytes)
+    return output.getvalue()
 
 
 def _score_summary(score: np.ma.MaskedArray, threshold: float) -> dict[str, float]:
@@ -388,10 +749,11 @@ def analyze_change(
     out_size: int = 512,
     threshold: float = 0.24,
     min_patch_pixels: int = 20,
+    aoi_geometry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if start_a > end_a or start_b > end_b:
         raise ValueError("Las fechas de inicio deben ser anteriores a las fechas finales.")
-    area_km2 = _area_km2(bbox)
+    area_km2 = _area_km2(bbox, aoi_geometry)
     if area_km2 > 40:
         raise ValueError(
             f"El área marcada es de {area_km2:.1f} km². Redúzcala a 40 km² o menos."
@@ -399,8 +761,12 @@ def analyze_change(
 
     search_a = search_scenes(bbox, start_a, end_a, max_cloud, scenes_per_period)
     search_b = search_scenes(bbox, start_b, end_b, max_cloud, scenes_per_period)
-    comp_a = build_composite(search_a["selected_items"], bbox, out_size)
-    comp_b = build_composite(search_b["selected_items"], bbox, out_size)
+    comp_a = build_composite(
+        search_a["selected_items"], bbox, out_size, aoi_geometry=aoi_geometry
+    )
+    comp_b = build_composite(
+        search_b["selected_items"], bbox, out_size, aoi_geometry=aoi_geometry
+    )
 
     score, _ = _change_score(comp_a, comp_b)
     anomaly = np.asarray(score.filled(0) >= threshold, dtype=np.uint8)
@@ -453,6 +819,7 @@ def analyze_change(
 
     return {
         "bbox": bbox,
+        "aoi_geometry": aoi_geometry,
         "area_km2": area_km2,
         "changed_pct": changed_pct,
         "changed_km2": area_changed,
@@ -529,6 +896,7 @@ def analyze_historical_series(
     window_start: date,
     window_end: date,
     max_cloud: int = 35,
+    aoi_geometry: dict[str, Any] | None = None,
     scenes_per_year: int = 3,
     out_size: int = 320,
     threshold: float = 0.24,
@@ -545,7 +913,7 @@ def analyze_historical_series(
     if (window_end.month, window_end.day) < (window_start.month, window_start.day):
         raise ValueError("La ventana anual debe iniciar y terminar dentro del mismo año.")
 
-    area_km2 = _area_km2(bbox)
+    area_km2 = _area_km2(bbox, aoi_geometry)
     if area_km2 > 25:
         raise ValueError(
             f"El área marcada es de {area_km2:.1f} km². Para la serie histórica redúzcala a 25 km² o menos."
@@ -577,6 +945,7 @@ def analyze_historical_series(
                 bbox,
                 out_size=out_size,
                 include_scene_previews=True,
+                aoi_geometry=aoi_geometry,
             )
             composites[year] = comp
             cloud_values = [row["cloud_cover"] for row in comp["scenes"]]
@@ -616,6 +985,7 @@ def analyze_historical_series(
 
     transition_rows: list[dict[str, Any]] = []
     transition_assets: dict[str, dict[str, Any]] = {}
+    transition_geojsons: dict[str, dict[str, Any]] = {}
     previous_year = valid_years[0]
     for current_year in valid_years[1:]:
         score, _ = _change_score(composites[previous_year], composites[current_year])
@@ -647,6 +1017,13 @@ def analyze_historical_series(
                 anomaly, f"Áreas priorizadas {label}", "Reds", 0, 1
             ),
         }
+        transition_geojsons[label] = _anomaly_geojson(
+            anomaly, bbox, min_patch_pixels
+        )
+        for feature in transition_geojsons[label].get("features", []):
+            feature.setdefault("properties", {})["transition"] = label
+            feature["properties"]["from_year"] = previous_year
+            feature["properties"]["to_year"] = current_year
         previous_year = current_year
 
     transitions = pd.DataFrame(transition_rows)
@@ -683,12 +1060,14 @@ def analyze_historical_series(
 
     return {
         "bbox": bbox,
+        "aoi_geometry": aoi_geometry,
         "area_km2": area_km2,
         "valid_years": valid_years,
         "missing_years": [year for year in years if year not in composites],
         "annual": annual,
         "annual_gallery": annual_gallery,
         "transitions": transitions,
+        "transition_geojsons": transition_geojsons,
         "scene_previews": scene_previews,
         "candidates": pd.DataFrame(candidate_rows),
         "warnings": warnings,
@@ -744,8 +1123,8 @@ def comparison_gallery_zip(result: dict[str, Any]) -> bytes:
             "escenas_candidatas.csv", result["candidates"].to_csv(index=False).encode("utf-8-sig")
         )
         archive.writestr(
-            "anomalias.geojson",
-            json.dumps(result["geojson"], ensure_ascii=False, indent=2),
+            "anomalias_google_earth.kmz",
+            comparison_kmz(result),
         )
         archive.writestr(
             "metadatos.json",
@@ -775,8 +1154,8 @@ def historical_gallery_zip(result: dict[str, Any]) -> bytes:
             "escenas_candidatas.csv", result["candidates"].to_csv(index=False).encode("utf-8-sig")
         )
         archive.writestr(
-            "anomalias_acumuladas.geojson",
-            json.dumps(result["accumulated_geojson"], ensure_ascii=False, indent=2),
+            "anomalias_acumuladas_google_earth.kmz",
+            historical_kmz(result),
         )
         archive.writestr(
             "metadatos.json",
