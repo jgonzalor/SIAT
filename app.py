@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import calendar
+import inspect
 import os
 from datetime import date
 from typing import Any
@@ -18,13 +20,18 @@ from core.engine import (
     historical_report_excel,
 )
 
+try:
+    from core.source_catalog import scan_multisource_catalog
+except Exception:
+    scan_multisource_catalog = None
+
 st.set_page_config(
-    page_title="Sentinel IAT · Fusión multifuente",
+    page_title="Sentinel IAT · Fusión multifuente v6.1",
     page_icon="🛰️",
     layout="wide",
 )
 
-st.title("🛰️ Sentinel IAT · Serie Histórica y Fusión Multifuente")
+st.title("🛰️ Sentinel IAT · Serie Histórica y Fusión Multifuente v6.1")
 st.caption(
     "Serie histórica Sentinel-2 con exploración automática de Landsat, radar Sentinel-1, INEGI y Planet opcional"
 )
@@ -140,6 +147,91 @@ def _secret(name: str) -> str | None:
         pass
     value = os.getenv(name)
     return value or None
+
+
+def _safe_annual_date(year: int, reference: date) -> date:
+    """Recrea mes/día en otro año, ajustando 29 de febrero cuando sea necesario."""
+    last_day = calendar.monthrange(year, reference.month)[1]
+    return date(year, reference.month, min(reference.day, last_day))
+
+
+def _run_historical_engine(
+    *,
+    bbox: list[float],
+    aoi_geometry: dict[str, Any],
+    start_year: int,
+    end_year: int,
+    window_start: date,
+    window_end: date,
+    max_cloud: int,
+    scenes_per_year: int,
+    threshold: float,
+    progress_callback: Any,
+    scan_additional_sources: bool,
+    planet_api_key: str | None,
+) -> dict[str, Any]:
+    """Adaptador compatible con motores v5/v6 y despliegues Streamlit con archivos mezclados."""
+    base_kwargs: dict[str, Any] = {
+        "bbox": bbox,
+        "aoi_geometry": aoi_geometry,
+        "start_year": start_year,
+        "end_year": end_year,
+        "window_start": window_start,
+        "window_end": window_end,
+        "max_cloud": max_cloud,
+        "scenes_per_year": scenes_per_year,
+        "threshold": threshold,
+        "progress_callback": progress_callback,
+    }
+
+    parameters = inspect.signature(analyze_historical_series).parameters
+    engine_handles_multisource = "scan_additional_sources" in parameters
+    if engine_handles_multisource:
+        base_kwargs["scan_additional_sources"] = scan_additional_sources
+    if "planet_api_key" in parameters:
+        base_kwargs["planet_api_key"] = planet_api_key
+
+    result = analyze_historical_series(**base_kwargs)
+
+    # Compatibilidad: si Streamlit conservó un engine.py anterior, la exploración
+    # multifuente se ejecuta aquí en vez de abortar toda la serie histórica.
+    if scan_additional_sources and not engine_handles_multisource:
+        warnings = list(result.get("warnings") or [])
+        if scan_multisource_catalog is None:
+            warnings.append(
+                "La serie histórica terminó, pero core/source_catalog.py no está disponible. "
+                "Reemplace toda la carpeta core para habilitar la exploración multifuente."
+            )
+            result["source_inventory"] = None
+        else:
+            try:
+                progress_callback(1.0, "Consultando fuentes adicionales…")
+                source_inventory = scan_multisource_catalog(
+                    bbox=bbox,
+                    aoi_geometry=aoi_geometry,
+                    start=_safe_annual_date(start_year, window_start),
+                    end=_safe_annual_date(end_year, window_end),
+                    max_cloud=max_cloud,
+                    planet_api_key=planet_api_key,
+                )
+                result["source_inventory"] = source_inventory
+                warnings.extend(
+                    f"Fuentes: {message}"
+                    for message in source_inventory.get("warnings", [])
+                )
+            except Exception as exc:
+                result["source_inventory"] = None
+                warnings.append(f"No fue posible completar la exploración multifuente: {exc}")
+        result["warnings"] = warnings
+        metadata = dict(result.get("metadata") or {})
+        metadata["additional_source_scan"] = True
+        metadata["compatibility_adapter"] = True
+        metadata["best_additional_source"] = (
+            result.get("source_inventory") or {}
+        ).get("best_source")
+        result["metadata"] = metadata
+
+    return result
 
 
 def _show_scene_gallery(scene_previews: list[dict[str, Any]], year_filter: str) -> None:
@@ -349,7 +441,7 @@ if run_history:
         progress.progress(min(max(value, 0.0), 1.0), text=message)
 
     try:
-        result = analyze_historical_series(
+        result = _run_historical_engine(
             bbox=bbox,
             aoi_geometry=aoi_geometry,
             start_year=int(start_year),

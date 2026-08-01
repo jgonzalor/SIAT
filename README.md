@@ -1,4 +1,4 @@
-# Sentinel IAT · Serie Histórica y Fusión Multifuente v6
+# Sentinel IAT · Serie Histórica y Fusión Multifuente v6.1
 
 Aplicación Streamlit enfocada exclusivamente en el análisis territorial multitemporal y la consulta automática de fuentes satelitales disponibles para el polígono de estudio.
 
@@ -70,3 +70,17 @@ streamlit run app.py
 - Las fechas y cobertura de INEGI varían por producto.
 - Las imágenes comerciales dependen del contrato y licencia del usuario.
 - Los resultados priorizan áreas para revisión y no constituyen por sí solos una conclusión pericial, causal o delictiva.
+
+## Corrección v6.1
+
+La v6.1 incorpora un adaptador de compatibilidad entre `app.py` y `core/engine.py`.
+Evita el error:
+
+```text
+analyze_historical_series() got an unexpected keyword argument 'scan_additional_sources'
+```
+
+Ese error aparece cuando Streamlit ejecuta el `app.py` nuevo junto con un `core/engine.py` antiguo.
+Para actualizar correctamente, reemplace **todo el contenido del repositorio**, incluida la carpeta `core`, y reinicie la aplicación desde Streamlit Cloud.
+
+La v6.1 también puede terminar la serie histórica aunque Streamlit conserve temporalmente un motor anterior; en ese caso ejecuta la exploración multifuente mediante el adaptador de compatibilidad.
